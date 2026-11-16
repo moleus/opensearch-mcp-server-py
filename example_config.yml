@@ -11,6 +11,15 @@ clusters:
     opensearch_password: "your_password_here"
     max_response_size: 5242880  # 5MB limit
 
+  # Kubernetes Secret opensearch-credentials -> container env -> these references.
+  # Set OPENSEARCH_USERNAME_PROD from secretKeyRef key username and
+  # OPENSEARCH_PASSWORD_PROD from secretKeyRef key password. See USER_GUIDE.md.
+  # Uncomment this entry when those environment variables are set.
+  # production:
+  #   opensearch_url: "${OPENSEARCH_URL_PROD:-https://opensearch.example.com:9200}"
+  #   opensearch_username: "${OPENSEARCH_USERNAME_PROD}"
+  #   opensearch_password: "${OPENSEARCH_PASSWORD_PROD}"
+
   remote-cluster:
     opensearch_url: "https://your-opensearch-domain.us-east-2.es.amazonaws.com"
     profile: "your-aws-profile"

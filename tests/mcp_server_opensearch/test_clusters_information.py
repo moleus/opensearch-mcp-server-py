@@ -1,3 +1,4 @@
+import logging
 import os
 import platform
 import pytest
@@ -5,11 +6,240 @@ import tempfile
 import yaml
 from mcp_server_opensearch.clusters_information import (
     ClusterInfo,
+    _resolve_env_references,
     add_cluster,
     cluster_registry,
     get_cluster,
     load_clusters_from_yaml,
 )
+from opensearch.client import ConfigurationError
+
+
+class TestEnvironmentReferences:
+    @pytest.mark.parametrize(
+        ('field', 'error_type'), [('timeout', 'int_parsing'), ('ssl_verify', 'bool_parsing')]
+    )
+    async def test_validation_errors_hide_expanded_secret(
+        self, tmp_path, monkeypatch, caplog, field, error_type
+    ):
+        secret = 'sensitive-password'
+        monkeypatch.setenv('SECRET_VALUE', secret)
+        monkeypatch.delenv('OPENSEARCH_HEADER_AUTH', raising=False)
+        path = tmp_path / 'clusters.yml'
+        path.write_text(
+            yaml.safe_dump(
+                {
+                    'clusters': {
+                        'invalid': {
+                            'opensearch_url': 'https://example.com',
+                            field: '${SECRET_VALUE}',
+                        }
+                    }
+                }
+            )
+        )
+        cluster_registry.clear()
+        await load_clusters_from_yaml(str(path))
+        expected_errors = [
+            f"Error processing cluster 'invalid': {[{'loc': (field,), 'type': error_type}]}"
+        ]
+        assert caplog.messages == [f'Loading errors: {expected_errors}']
+        assert secret not in caplog.text
+        assert cluster_registry == {}
+
+    async def test_other_cluster_errors_hide_values(self, tmp_path, monkeypatch, caplog):
+        secret = 'sensitive-password'
+        monkeypatch.delenv('OPENSEARCH_HEADER_AUTH', raising=False)
+        path = tmp_path / 'clusters.yml'
+        path.write_text('clusters:\n  invalid:\n    opensearch_url: https://example.com\n')
+
+        def fail_registration(**kwargs):
+            raise ValueError(secret)
+
+        monkeypatch.setattr(
+            'mcp_server_opensearch.clusters_information.add_cluster', fail_registration
+        )
+        cluster_registry.clear()
+        await load_clusters_from_yaml(str(path))
+        assert caplog.messages == [
+            'Loading errors: ["Error processing cluster \'invalid\': ValueError"]'
+        ]
+        assert secret not in caplog.text
+        assert cluster_registry == {}
+
+    @pytest.mark.parametrize('enabled', ['true', ' TrUe '])
+    async def test_header_auth_skips_unused_yaml_clusters(
+        self, tmp_path, monkeypatch, caplog, enabled
+    ):
+        monkeypatch.setenv('OPENSEARCH_HEADER_AUTH', enabled)
+        monkeypatch.delenv('MISSING_VALUE', raising=False)
+        path = tmp_path / 'clusters.yml'
+        path.write_text(
+            yaml.safe_dump(
+                {
+                    'clusters': {
+                        'literal': {'opensearch_url': 'https://example.com'},
+                        'unused': {'opensearch_url': '${MISSING_VALUE}'},
+                    }
+                }
+            )
+        )
+        cluster_registry.clear()
+        with caplog.at_level(logging.INFO):
+            await load_clusters_from_yaml(str(path))
+        assert cluster_registry == {}
+        assert caplog.messages == [
+            'Skipping YAML clusters because header authentication is enabled'
+        ]
+
+    def test_escape_preserves_two_dollars(self):
+        assert _resolve_env_references('$$${HOME}', 'example') == '$${HOME}'
+
+    @pytest.mark.parametrize(
+        'value', ['  password with spaces  ', '$PLAIN', '${not-valid}', 'line\nnext', '£€']
+    )
+    def test_literal_unchanged(self, value):
+        assert _resolve_env_references(value, 'example') == value
+
+    @pytest.mark.parametrize('value', [None, True, False, 42, 1.5])
+    def test_non_string_unchanged(self, value):
+        assert _resolve_env_references(value, 'example') is value
+
+    def test_nested_values_and_literal_keys(self, monkeypatch):
+        monkeypatch.setenv('CLUSTER_VALUE', '  resolved  ')
+        value = {'${CLUSTER_VALUE}': [{'password': '${CLUSTER_VALUE}'}, 42, None, True]}
+        assert _resolve_env_references(value, 'example') == {
+            '${CLUSTER_VALUE}': [{'password': '  resolved  '}, 42, None, True]
+        }
+        assert value['${CLUSTER_VALUE}'][0]['password'] == '${CLUSTER_VALUE}'
+
+    def test_nested_missing_field(self, monkeypatch):
+        monkeypatch.delenv('MISSING_VALUE', raising=False)
+        with pytest.raises(
+            ConfigurationError, match=r'example.*options\[0\].password.*MISSING_VALUE'
+        ):
+            _resolve_env_references({'options': [{'password': '${MISSING_VALUE}'}]}, 'example')
+
+    @pytest.mark.parametrize('env_value', [None, '', 'configured'])
+    @pytest.mark.parametrize('default', ['', '  fallback  '])
+    def test_default(self, monkeypatch, env_value, default):
+        if env_value is None:
+            monkeypatch.delenv('CONFIG_VALUE', raising=False)
+        else:
+            monkeypatch.setenv('CONFIG_VALUE', env_value)
+        assert _resolve_env_references('${CONFIG_VALUE:-' + default + '}', 'example') == (
+            env_value or default
+        )
+
+    def test_empty_variable_without_default(self, monkeypatch):
+        monkeypatch.setenv('CONFIG_VALUE', '')
+        assert _resolve_env_references('${CONFIG_VALUE}', 'example') == ''
+
+    @pytest.mark.parametrize('env_value', [None, 'configured'])
+    def test_escape(self, monkeypatch, env_value):
+        if env_value is None:
+            monkeypatch.delenv('CONFIG_VALUE', raising=False)
+        else:
+            monkeypatch.setenv('CONFIG_VALUE', env_value)
+        assert _resolve_env_references(
+            '$${CONFIG_VALUE}/$${CONFIG_VALUE:-default}', 'example'
+        ) == ('${CONFIG_VALUE}/${CONFIG_VALUE:-default}')
+
+    async def test_load_references_in_all_fields(self, tmp_path, monkeypatch):
+        values = {
+            'opensearch_url': 'https://example.com:9200',
+            'opensearch_username': 'user',
+            'opensearch_password': '  password: true\nclusters: [injected] ${UNCHANGED}  ',
+            'iam_arn': 'arn:aws:iam::123456789012:role/ExampleRole',
+            'profile': 'example',
+            'aws_region': 'us-east-1',
+            'opensearch_ca_cert_path': '/certs/ca.crt',
+            'opensearch_client_cert_path': '/certs/tls.crt',
+            'opensearch_client_key_path': '/certs/tls.key',
+        }
+        config = {}
+        for field, value in values.items():
+            variable = field.upper()
+            monkeypatch.setenv(variable, value)
+            config[field] = '${' + variable + '}'
+        config.update(
+            timeout='${TIMEOUT:-45}', ssl_verify='${VERIFY:-false}', opensearch_no_auth=False
+        )
+        monkeypatch.delenv('TIMEOUT', raising=False)
+        monkeypatch.delenv('VERIFY', raising=False)
+        path = tmp_path / 'clusters.yml'
+        path.write_text(yaml.safe_dump({'clusters': {'env-cluster': config}}))
+        cluster_registry.clear()
+        try:
+            await load_clusters_from_yaml(str(path))
+            cluster = get_cluster('env-cluster')
+            for field, value in values.items():
+                assert getattr(cluster, field) == value
+            assert cluster.timeout == 45
+            assert cluster.ssl_verify is False
+            assert cluster.opensearch_no_auth is False
+            assert set(cluster_registry) == {'env-cluster'}
+        finally:
+            cluster_registry.clear()
+
+    async def test_load_literal_password_unchanged(self, tmp_path):
+        password = '  literal $VALUE: true\nnext line  '
+        path = tmp_path / 'clusters.yml'
+        path.write_text(
+            yaml.safe_dump(
+                {
+                    'clusters': {
+                        'literal': {
+                            'opensearch_url': 'https://example.com',
+                            'opensearch_password': password,
+                        }
+                    }
+                }
+            )
+        )
+        cluster_registry.clear()
+        try:
+            await load_clusters_from_yaml(str(path))
+            assert get_cluster('literal').opensearch_password == password
+        finally:
+            cluster_registry.clear()
+
+    async def test_unset_error_without_secret_or_partial_registry(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        monkeypatch.setenv('SECRET_VALUE', 'sensitive-password')
+        monkeypatch.delenv('MISSING_VALUE', raising=False)
+        path = tmp_path / 'clusters.yml'
+        path.write_text(
+            yaml.safe_dump(
+                {
+                    'clusters': {
+                        'first': {'opensearch_url': 'https://example.com'},
+                        'second': {
+                            'opensearch_url': 'https://example.com',
+                            'opensearch_password': '${SECRET_VALUE}:${MISSING_VALUE}',
+                        },
+                    }
+                }
+            )
+        )
+        cluster_registry.clear()
+        with pytest.raises(ConfigurationError) as error:
+            await load_clusters_from_yaml(str(path))
+        message = str(error.value)
+        assert message == (
+            "Cluster 'second', field 'opensearch_password': "
+            "environment variable 'MISSING_VALUE' is not set"
+        )
+        assert 'sensitive-password' not in message + caplog.text
+        assert cluster_registry == {}
+
+    def test_embedded_multiple_references(self, monkeypatch):
+        monkeypatch.setenv('HOST', 'example.com')
+        monkeypatch.setenv('PORT', '9200')
+        assert _resolve_env_references('https://${HOST}:${PORT}', 'example') == (
+            'https://example.com:9200'
+        )
 
 
 class TestClusterInfo:

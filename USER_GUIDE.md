@@ -720,6 +720,47 @@ When using multi-mode, each cluster in your YAML configuration file accepts the 
 
 *Required for respective authentication method (basic auth, IAM role, or AWS credentials)
 
+### Environment references in cluster values
+
+Use `${VAR}` in any string value under `clusters` to read an environment variable at startup. References also work inside strings, lists, and nested mappings. Mapping keys and cluster names stay literal. Other configuration sections do not expand references.
+
+| Syntax | Result |
+|--------|--------|
+| `${VAR}` | The variable's value, including spaces. An empty value stays empty. If the variable is unset, startup raises `ConfigurationError` with the cluster, field, and variable name, without the value. |
+| `${VAR:-default}` | Use `default` if the variable is unset or empty. |
+| `$${VAR}` | The literal text `${VAR}`, without an environment lookup. |
+
+Variable names must match `[A-Za-z_][A-Za-z0-9_]*`. Defaults cannot contain braces. Expansion uses one pass, so references inside environment values or defaults stay literal. The server parses YAML before expansion and does not parse expanded text as YAML. Values without references stay unchanged. Existing field validation still applies, including conversion of numeric and boolean strings.
+
+For Kubernetes, keep references in the ConfigMap and supply the values from an existing Secret. The Secret `opensearch-credentials` must have `username` and `password` keys. Mount the following configuration at `/config/clusters.yml`
+
+```yaml
+clusters:
+  production:
+    opensearch_url: "${OPENSEARCH_URL_PROD:-https://opensearch.example.com:9200}"
+    opensearch_username: "${OPENSEARCH_USERNAME_PROD}"
+    opensearch_password: "${OPENSEARCH_PASSWORD_PROD}"
+```
+
+Use this container configuration in your Deployment:
+
+```yaml
+args: ["--mode", "multi", "--config", "/config/clusters.yml"]
+env:
+  - name: OPENSEARCH_USERNAME_PROD
+    valueFrom:
+      secretKeyRef:
+        name: opensearch-credentials
+        key: username
+  - name: OPENSEARCH_PASSWORD_PROD
+    valueFrom:
+      secretKeyRef:
+        name: opensearch-credentials
+        key: password
+```
+
+The ConfigMap contains no credentials. The same YAML references work with environment variables supplied by Docker or systemd. Restart the server after you change an environment value.
+
 ### Authentication Method Requirements
 
 | Authentication Method | Required Parameters | Optional Parameters |

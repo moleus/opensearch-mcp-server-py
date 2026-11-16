@@ -3,9 +3,10 @@
 
 import logging
 import os
+import re
 import yaml
-from pydantic import BaseModel
-from typing import Dict, Optional
+from pydantic import BaseModel, ValidationError
+from typing import Any, Dict, Optional
 
 
 class ClusterInfo(BaseModel):
@@ -32,6 +33,46 @@ class ClusterInfo(BaseModel):
 # Key: string name (cluster identifier)
 # Value: ClusterInfo object containing cluster configuration
 cluster_registry: Dict[str, ClusterInfo] = {}
+
+_ENV_REFERENCE = re.compile(r'\$\$\{|\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^{}]*))?\}')
+
+
+def _resolve_env_references(value: Any, cluster_name: str, field: str = '') -> Any:
+    """Resolve environment references in string values, without changing YAML types or keys."""
+    if isinstance(value, dict):
+        return {
+            key: _resolve_env_references(
+                item, cluster_name, f'{field}.{key}' if field else str(key)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _resolve_env_references(item, cluster_name, f'{field}[{index}]')
+            for index, item in enumerate(value)
+        ]
+    if not isinstance(value, str):
+        return value
+
+    def replace(match: re.Match) -> str:
+        if match.group(0) == '$${':
+            return '${'
+        variable, default = match.groups()
+        resolved = os.environ.get(variable)
+        if default is not None and not resolved:
+            return default
+        if resolved is None:
+            # The client imports this module, so defer the exception import.
+            from opensearch.client import ConfigurationError
+
+            raise ConfigurationError(
+                f"Cluster '{cluster_name}', field '{field}': "
+                f"environment variable '{variable}' is not set"
+            )
+        return resolved
+
+    # One pass keeps environment values and escaped references literal.
+    return _ENV_REFERENCE.sub(replace, value)
 
 
 def add_cluster(name: str, cluster_info: ClusterInfo) -> None:
@@ -68,8 +109,15 @@ async def load_clusters_from_yaml(file_path: str) -> None:
         yaml.YAMLError: If the YAML file is malformed
         UnicodeDecodeError: If the file has encoding issues
         OSError: For other file system related errors
+        ConfigurationError: If a cluster references an unset environment variable without a default
     """
     if not file_path:
+        return
+
+    from mcp_server_opensearch.server_instructions import is_header_auth_enabled
+
+    if is_header_auth_enabled():
+        logging.info('Skipping YAML clusters because header authentication is enabled')
         return
 
     # Check if file exists
@@ -98,6 +146,10 @@ async def load_clusters_from_yaml(file_path: str) -> None:
 
         # Process clusters
         clusters = config.get('clusters', {})
+        clusters = {
+            name: _resolve_env_references(cluster_config, name)
+            for name, cluster_config in clusters.items()
+        }
         result['total_clusters'] = len(clusters)
         logging.info(f'Total clusters found in config file: {result["total_clusters"]}')
 
@@ -133,8 +185,16 @@ async def load_clusters_from_yaml(file_path: str) -> None:
                 add_cluster(name=cluster_name, cluster_info=cluster_info)
                 result['loaded_clusters'].append(cluster_name)
 
+            except ValidationError as e:
+                details = [
+                    {'loc': error['loc'], 'type': error['type']}
+                    for error in e.errors(include_input=False, include_context=False)
+                ]
+                result['errors'].append(f"Error processing cluster '{cluster_name}': {details}")
             except Exception as e:
-                result['errors'].append(f"Error processing cluster '{cluster_name}': {str(e)}")
+                result['errors'].append(
+                    f"Error processing cluster '{cluster_name}': {type(e).__name__}"
+                )
 
         result['loaded_clusters'] = list(cluster_registry.keys())
         if result['errors']:
